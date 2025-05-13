@@ -1957,6 +1957,23 @@ def PDE_EQs(D_t, D_x, D_y, D_z, U, U_t=None, U_x=None, U_y=None, U_z=None):
 
 # ======================================== Velocity ========================================
 
+def save_model(path: str, global_step: int,
+               model: RadianceField, prop_model: RadianceField | None, optimizer: torch.optim.Optimizer,
+               vel_model=None, vel_optimizer=None):
+    save_dic = {
+        'global_step': global_step,
+        'network_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+    }
+    if prop_model is not None:
+        save_dic['network_prop_state_dict'] = prop_model.state_dict()
+
+    if vel_model is not None:
+        save_dic['network_vel_state_dict'] = vel_model.state_dict()
+        save_dic['vel_optimizer_state_dict'] = vel_optimizer.state_dict()
+
+    torch.save(save_dic, path)
+
 if __name__ == "__main__":
     device = torch.device("cuda:0")
     ### ==================== LOAD CONFIG ==================== ###
@@ -2267,5 +2284,10 @@ if __name__ == "__main__":
                 param_group['lr'] = new_lrate
 
         print(f"loss: {loss.item():.4f}, img_loss: {img_loss.item():.4f}, psnr: {psnr.item():.2f}")
+
+        if (i in (100, 10000, 20000, 40000) or i % args.i_weights == 0) and i > start + 1:
+            path = os.path.join(expdir, '{:06d}.tar'.format(i))
+            save_model(path, global_step, model, prop_model, optimizer, vel_model, vel_optimizer)
+            print('Saved checkpoints at', path)
 
         global_step += 1
