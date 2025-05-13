@@ -2285,7 +2285,10 @@ if __name__ == "__main__":
 
         print(f"loss: {loss.item():.4f}, img_loss: {img_loss.item():.4f}, psnr: {psnr.item():.2f}")
 
-        if (i in (100, 10000, 20000, 40000) or i % args.i_weights == 0) and i > start + 1:
+        i_weights = 2000
+        expdir = os.path.join('logs', 'sphere_neux')
+        os.makedirs(expdir, exist_ok=True)
+        if (i in (100, 10000, 20000, 40000) or i % i_weights == 0) and i > start + 1:
             path = os.path.join(expdir, '{:06d}.tar'.format(i))
             save_model(path, global_step, model, prop_model, optimizer, vel_model, vel_optimizer)
             print('Saved checkpoints at', path)
