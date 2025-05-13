@@ -2121,7 +2121,7 @@ if __name__ == "__main__":
                         sdf = sdf_model.sdf(training_samples[..., :3])
                         gradient = sdf_model.gradient(training_samples[..., :3])
                 sdf, gradient = sdf.detach(), gradient.detach()
-                neumann_loss = sdf_model.opaque_density(sdf).detach() * F.relu(-torch.sum(_vel * gradient, dim=-1, keepdim=True))
+                neumann_loss = sdf_model.opaque_density(sdf).detach() * torch.nn.functional.relu(-torch.sum(_vel * gradient, dim=-1, keepdim=True))
                 neumann_loss = torch.mean(neumann_loss)
                 if neumann > 0.0:
                     vel_loss = vel_loss + neumann_loss * neumann
