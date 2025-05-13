@@ -1,7 +1,9 @@
 import torch
+import torchvision
 import numpy as np
 import argparse
 import abc
+import tqdm
 
 
 class SingleVarianceNetwork(torch.nn.Module):
@@ -1085,6 +1087,876 @@ def model_fading_update(model: RadianceField, prop_model: RadianceField | None, 
         vel_model.update_fading_step(global_step - vel_delay)
 
 
+# VGG Tool, https://github.com/crowsonkb/style-transfer-pytorch/
+# set pooling = 'max'
+class VGGFeatures(torch.nn.Module):
+    def __init__(self, layers):
+        super().__init__()
+        self.layers = sorted(set(layers))
+
+        # The PyTorch pre-trained VGG-19 expects sRGB inputs in the range [0, 1] which are then
+        # normalized according to this transform, unlike Simonyan et al.'s original model.
+        self.normalize = torchvision.transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                          std=[0.229, 0.224, 0.225])
+
+        # The PyTorch pre-trained VGG-19 has different parameters from Simonyan et al.'s original
+        # model.
+        self.model = torchvision.models.vgg19(pretrained=True).features[:self.layers[-1] + 1]
+
+        # Reduces edge artifacts.
+        self.model[0] = self._change_padding_mode(self.model[0], 'replicate')
+
+        self.model.eval()
+        self.model.requires_grad_(False)
+
+    @staticmethod
+    def _change_padding_mode(conv, padding_mode):
+        new_conv = torch.nn.Conv2d(conv.in_channels, conv.out_channels, conv.kernel_size,
+                                   stride=conv.stride, padding=conv.padding,
+                                   padding_mode=padding_mode)
+        with torch.no_grad():
+            new_conv.weight.copy_(conv.weight)
+            new_conv.bias.copy_(conv.bias)
+        return new_conv
+
+    @staticmethod
+    def _get_min_size(layers):
+        last_layer = max(layers)
+        min_size = 1
+        for layer in [4, 9, 18, 27, 36]:
+            if last_layer < layer:
+                break
+            min_size *= 2
+        return min_size
+
+    def forward(self, input, layers=None):
+        # input shape, b,3,h,w
+        layers = self.layers if layers is None else sorted(set(layers))
+        h, w = input.shape[2:4]
+        min_size = self._get_min_size(layers)
+        if min(h, w) < min_size:
+            raise ValueError(f'Input is {h}x{w} but must be at least {min_size}x{min_size}')
+        feats = {'input': input}
+        norm_in = torch.stack([self.normalize(input[_i]) for _i in range(input.shape[0])], dim=0)
+        # input = self.normalize(input)
+        for i in range(max(layers) + 1):
+            norm_in = self.model[i](norm_in)
+            if i in layers:
+                feats[i] = norm_in
+        return feats
+
+
+# VGG Loss Tool
+class VGGLossTool(object):
+    def __init__(self, device):
+        # The default content and style layers in Gatys et al. (2015):
+        #   content_layers = [22], 'relu4_2'
+        #   style_layers = [1, 6, 11, 20, 29], relu layers: [ 'relu1_1', 'relu2_1', 'relu3_1', 'relu4_1', 'relu5_1']
+        # We use [5, 10, 19, 28], conv layers before relu: [ 'conv2_1', 'conv3_1', 'conv4_1', 'conv5_1']
+        self.layer_list = [5, 10, 19, 28]
+        self.layer_names = [
+            "block2_conv1",
+            "block3_conv1",
+            "block4_conv1",
+            "block5_conv1",
+        ]
+        self.device = device
+
+        # Build a VGG19 model loaded with pre-trained ImageNet weights
+        self.vggmodel = VGGFeatures(self.layer_list).to(device)
+
+    def feature_norm(self, feature):
+        # feature: b,h,w,c
+        feature_len = torch.sqrt(torch.sum(torch.square(feature), dim=-1, keepdim=True) + 1e-12)
+        norm = feature / feature_len
+        return norm
+
+    def cos_sim(self, a, b):
+        cos_sim_ab = torch.sum(a * b, dim=-1)
+        # cosine similarity, -1~1, 1 best
+        cos_sim_ab_score = 1.0 - torch.mean(cos_sim_ab)  # 0 ~ 2, 0 best
+        return cos_sim_ab_score
+
+    def compute_cos_loss(self, img, ref):
+        # input img, ref should be in range of [0,1]
+        input_tensor = torch.stack([ref, img], dim=0)
+
+        input_tensor = input_tensor.permute((0, 3, 1, 2))
+        # print(input_tensor.shape)
+        _feats = self.vggmodel(input_tensor, layers=self.layer_list)
+
+        # Initialize the loss
+        loss = []
+        # Add loss
+        for layer_i, layer_name in zip(self.layer_list, self.layer_names):
+            cur_feature = _feats[layer_i]
+            reference_features = self.feature_norm(cur_feature[0, ...])
+            img_features = self.feature_norm(cur_feature[1, ...])
+
+            feature_metric = self.cos_sim(reference_features, img_features)
+            loss += [feature_metric]
+        return loss
+
+
+def vgg_sample(vgg_strides: int, num_rays: int, frame: torch.Tensor, bg_color: torch.Tensor, dw: int = None,
+               steps: int = None):
+    if steps is None:
+        strides = vgg_strides + np.random.randint(-1, 2)  # args.vgg_strides(+/-)1 or args.vgg_strides
+    else:
+        strides = vgg_strides + steps % 3 - 1
+    H, W = frame.shape[:2]
+    if dw is None:
+        dw = max(20, min(40, int(np.sqrt(num_rays))))
+    vgg_min_border = 10
+    strides = min(strides, min(H - vgg_min_border, W - vgg_min_border) / dw)
+    strides = int(strides)
+
+    coords = torch.stack(torch.meshgrid(torch.linspace(0, H - 1, H), torch.linspace(0, W - 1, W), indexing='ij'),
+                         dim=-1).to(frame.device)  # (H, W, 2)
+    target_grey = torch.mean(torch.abs(frame - bg_color), dim=-1, keepdim=True)  # (H, W, 1)
+    img_wei = coords.to(torch.float32) * target_grey
+    center_coord = torch.sum(img_wei, dim=(0, 1)) / torch.sum(target_grey)
+    center_coord = center_coord.cpu().numpy()
+    # add random jitter
+    random_R = dw * strides / 2.0
+    # mean and standard deviation: center_coord, random_R/3.0, so that 3sigma < random_R
+    random_x = np.random.normal(center_coord[1], random_R / 3.0) - 0.5 * dw * strides
+    random_y = np.random.normal(center_coord[0], random_R / 3.0) - 0.5 * dw * strides
+
+    offset_w = int(min(max(vgg_min_border, random_x), W - dw * strides - vgg_min_border))
+    offset_h = int(min(max(vgg_min_border, random_y), H - dw * strides - vgg_min_border))
+
+    coords_crop = coords[offset_h:offset_h + dw * strides:strides, offset_w:offset_w + dw * strides:strides, :]
+    return coords_crop, dw
+
+
+def fade_in_weight(step, start, duration):
+    return min(max((float(step) - start) / duration, 0.0), 1.0)
+
+
+# Ghost Density Loss Tool
+def ghost_loss_func(out: NeRFOutputs, bg: torch.Tensor, scale: float = 4.0):
+    ghost_mask = torch.mean(torch.square(out.rgb - bg), -1)
+    # ghost_mask = torch.sigmoid(ghost_mask*-1.0) + den_penalty # (0 to 0.5) + den_penalty
+    ghost_mask = torch.exp(ghost_mask * -scale)
+    ghost_alpha = ghost_mask * out.acc
+    return torch.mean(torch.square(ghost_alpha))
+
+
+# ======================================== Data Loader ========================================
+import os
+import imageio
+import cv2
+import json
+from torch.utils.data import Dataset
+
+
+def trans_t(t: float):
+    return np.array([
+        [1, 0, 0, 0],
+        [0, 1, 0, 0],
+        [0, 0, 1, t],
+        [0, 0, 0, 1]], dtype=np.float32)
+
+
+def rot_phi(phi: float):
+    return np.array([
+        [1, 0, 0, 0],
+        [0, np.cos(phi), -np.sin(phi), 0],
+        [0, np.sin(phi), np.cos(phi), 0],
+        [0, 0, 0, 1]], dtype=np.float32)
+
+
+def rot_theta(th: float):
+    return np.array([
+        [np.cos(th), 0, -np.sin(th), 0],
+        [0, 1, 0, 0],
+        [np.sin(th), 0, np.cos(th), 0],
+        [0, 0, 0, 1]], dtype=np.float32)
+
+
+def pose_spherical(theta: float, phi: float, radius: float, rotZ=True, center: np.ndarray = None):
+    # spherical, rotZ=True: theta rotate around Z; rotZ=False: theta rotate around Y
+    # center: additional translation, normally the center coord.
+    c2w = trans_t(radius)
+    c2w = rot_phi(phi / 180. * np.pi) @ c2w
+    c2w = rot_theta(theta / 180. * np.pi) @ c2w
+    if rotZ:  # swap yz, and keep right-hand
+        c2w = np.array([[-1, 0, 0, 0], [0, 0, 1, 0], [0, 1, 0, 0], [0, 0, 0, 1]], dtype=np.float32) @ c2w
+
+    if center is not None:
+        c2w[:3, 3] += center
+    return c2w
+
+
+def intrinsics_from_hwf(H: int, W: int, focal: float):
+    return np.array([
+        [focal, 0, 0.5 * W],
+        [0, focal, 0.5 * H],
+        [0, 0, 1]
+    ], dtype=np.float32)
+
+
+class VideoData:
+    def __init__(self, args: dict | None, basedir: str = '', half_res: str = None):
+        if args is None:
+            self.delta_t = 1.0
+            self.transform_matrix = np.empty(0)
+            self.frames = np.empty(0)
+            self.focal = 0.0
+            return
+
+        filename = os.path.join(basedir, args['file_name'])
+        meta = imageio.v3.immeta(filename)
+        reader = imageio.imiter(filename)
+
+        frame_rate = args.get('frame_rate', meta['fps'])
+        frame_num = args.get('frame_num')
+        if not np.isfinite(frame_num):
+            frame_num = meta['nframes']
+            if not np.isfinite(frame_num):
+                frame_num = meta['duration'] * meta['fps']
+            frame_num = round(frame_num)
+
+        self.delta_t = 1.0 / frame_rate
+        if 'transform_matrix' in args:
+            self.transform_matrix = np.array(args['transform_matrix'], dtype=np.float32)
+        else:
+            self.transform_matrix = np.array(args['transform_matrix_list'], dtype=np.float32)
+
+        frames = tuple(reader)[:frame_num]
+        H, W = frames[0].shape[:2]
+        if half_res == 'half':
+            H //= 2
+            W //= 2
+        elif half_res == 'quarter':
+            H //= 4
+            W //= 4
+        elif half_res is not None:
+            if half_res != 'normal':
+                print("Unsupported half_res value", half_res)
+            half_res = None
+
+        if half_res is not None:
+            frames = [cv2.resize(frame, (W, H), interpolation=cv2.INTER_AREA) for frame in frames]
+        self.frames: np.ndarray = np.float32(frames) / 255.0
+        self.focal = float(0.5 * self.frames.shape[2] / np.tan(0.5 * args['camera_angle_x']))
+
+    def c2w(self, frame: int = None) -> np.ndarray:
+        if self.transform_matrix.ndim == 2 or frame is None:
+            return self.transform_matrix
+        return self.transform_matrix[frame]
+
+    def intrinsics(self):
+        return intrinsics_from_hwf(self.frames.shape[1], self.frames.shape[2], self.focal)
+
+    def __len__(self) -> int:
+        return self.frames.shape[0]
+
+
+class PINFFrameDataBase:
+    def __init__(self):
+        # placeholders
+        self.voxel_tran: np.ndarray | None = None
+        self.voxel_scale: np.ndarray | None = None
+        self.videos: dict[str, list[VideoData]] = {}
+        self.t_info: np.ndarray | None = None
+        self.render_poses: np.ndarray | None = None
+        self.render_timesteps: np.ndarray | None = None
+        self.bkg_color: np.ndarray | None = None
+        self.near, self.far = 0.0, 1.0
+
+
+class PINFFrameData(PINFFrameDataBase):
+    def __init__(self, basedir: str, half_res: str | bool = None, normalize_time: bool = False,
+                 apply_tran: bool = False, **kwargs):
+        super().__init__()
+        with open(os.path.join(basedir, 'info.json'), 'r') as fp:
+            # read render settings
+            meta = json.load(fp)
+        near = float(meta['near'])
+        far = float(meta['far'])
+        radius = (near + far) * 0.5
+        phi = float(meta['phi'])
+        rotZ = (meta['rot'] == 'Z')
+        r_center = np.float32(meta['render_center'])
+        bkg_color = np.float32(meta['frame_bkg_color'])
+        if isinstance(half_res, bool):  # compatible with nerf
+            half_res = 'half' if half_res else None
+
+        # read scene data
+        voxel_tran = np.float32(meta['voxel_matrix'])
+        voxel_tran = np.stack([voxel_tran[:, 2], voxel_tran[:, 1], voxel_tran[:, 0], voxel_tran[:, 3]],
+                              axis=1)  # swap_zx
+        voxel_scale = np.broadcast_to(meta['voxel_scale'], [3]).astype(np.float32)
+
+        if apply_tran:
+            voxel_tran[:3, :3] *= voxel_scale[0]
+            scene_tran = np.linalg.inv(voxel_tran)
+            voxel_tran = np.eye(4, dtype=np.float32)
+            voxel_scale /= voxel_scale[0]
+            near, far = 0.1, 2.0  # TODO apply conversion
+
+        else:
+            scene_tran = None
+
+        self.voxel_tran: np.ndarray = voxel_tran
+        self.voxel_scale: np.ndarray = voxel_scale
+
+        self.videos: dict[str, list[VideoData]] = {
+            'train': [],
+            'test': [],
+            'val': [],
+        }
+
+        # read video frames
+        # all videos should be synchronized, having the same frame_rate and frame_num
+        for s in ('train', 'val', 'test'):
+            video_list = meta[s + '_videos'] if (s + '_videos') in meta else []
+
+            for train_video in video_list:
+                video = VideoData(train_video, basedir, half_res=half_res)
+                self.videos[s].append(video)
+
+            if len(video_list) == 0:
+                self.videos[s] = self.videos['train'][:1]
+
+        self.videos['test'] += self.videos['val']  # val vid not used for now
+        self.videos['test'] += self.videos['train']  # for test
+        video = self.videos['train'][0]
+        # assume identical frame rate and length
+        if normalize_time:
+            self.t_info = np.float32([0.0, 1.0, 1.0 / len(video)])
+        else:
+            self.t_info = np.float32([0.0, video.delta_t * len(video), video.delta_t])  # min t, max t, delta_t
+
+        # set render settings:
+        sp_n = 40  # an even number!
+        sp_poses = [
+            pose_spherical(angle, phi, radius, rotZ, r_center)
+            for angle in np.linspace(-180, 180, sp_n + 1)[:-1]
+        ]
+
+        if scene_tran is not None:
+            for vk in self.videos:
+                for video in self.videos[vk]:
+                    video.transform_matrix = scene_tran @ video.transform_matrix
+            sp_poses = [scene_tran @ pose for pose in sp_poses]
+
+        self.render_poses = np.stack(sp_poses, 0)  # [sp_poses[36]]*sp_n, for testing a single pose
+        self.render_timesteps = np.linspace(self.t_info[0], self.t_info[1], num=sp_n).astype(np.float32)
+        self.bkg_color = bkg_color
+        self.near, self.far = near, far
+
+
+# use multiple videos as dataset
+class PINFDataset:
+    def __init__(self, base: PINFFrameDataBase, split: str = 'train'):
+        super().__init__()
+        self.base = base
+        self.videos = self.base.videos[split]
+
+    def __len__(self):
+        return len(self.videos) * len(self.videos[0])
+
+    def get_video_and_frame(self, item: int) -> tuple[VideoData, int]:
+        vi, fi = divmod(item, len(self.videos[0]))
+        video = self.videos[vi]
+        return video, fi
+
+
+class NeRFDataset(Dataset):
+    def __init__(self):
+        super().__init__()
+
+    @abc.abstractmethod
+    def __len__(self) -> int:
+        pass
+
+    @abc.abstractmethod
+    def __getitem__(self, item: int) -> tuple[np.ndarray | None, np.ndarray, np.ndarray | None, dict]:
+        """returns image(optional for test), pose, intrinsics(optional for test), and extras"""
+        pass
+
+    # poses for prediction, usually given by pose_spherical
+    def predict_poses(self):
+        render_poses = getattr(self, 'render_poses', None)
+        return render_poses if isinstance(render_poses, np.ndarray) else None
+
+    # generate predictor from render_poses
+    def predictor(self) -> Optional["NeRFPredictor"]:
+        poses = self.predict_poses()
+        return NeRFPredictor(poses) if poses is not None else None
+
+
+class NeRFPredictor(NeRFDataset):
+    """Given poses for prediction (usually generated from pose_spherical), used for test"""
+
+    def __init__(self, poses: np.ndarray, extra_fn: Callable[[int], dict] = lambda _: {}):
+        super().__init__()
+        self.poses = poses
+        self.extra_fn = extra_fn
+
+    def __len__(self):
+        return len(self.poses)
+
+    def __getitem__(self, item):
+        # image, intrinsics unavailable
+        return None, self.poses[item], None, self.extra_fn(item)
+
+    def predict_poses(self):
+        return self.poses
+
+    def predictor(self):
+        return self
+
+
+class NeRFDataset(Dataset):
+    def __init__(self):
+        super().__init__()
+
+    @abc.abstractmethod
+    def __len__(self) -> int:
+        pass
+
+    @abc.abstractmethod
+    def __getitem__(self, item: int) -> tuple[np.ndarray | None, np.ndarray, np.ndarray | None, dict]:
+        """returns image(optional for test), pose, intrinsics(optional for test), and extras"""
+        pass
+
+    # poses for prediction, usually given by pose_spherical
+    def predict_poses(self):
+        render_poses = getattr(self, 'render_poses', None)
+        return render_poses if isinstance(render_poses, np.ndarray) else None
+
+    # generate predictor from render_poses
+    def predictor(self) -> Optional["NeRFPredictor"]:
+        poses = self.predict_poses()
+        return NeRFPredictor(poses) if poses is not None else None
+
+
+# use a validate/test video for validation/testing
+class PINFTestDataset(NeRFDataset):
+    def __init__(self, base: PINFFrameDataBase, split: str = 'test', video_id: int = 0,
+                 bkg_color: np.ndarray = None, skip: int = 1):
+        super().__init__()
+        self.base = base
+        self.video = self.base.videos[split][video_id]
+        self.bkg_color = base.bkg_color if bkg_color is None else bkg_color
+        self.skip = skip
+
+    def __len__(self):
+        return len(self.video) // self.skip
+
+    # use poses from test video, have gt
+    def __getitem__(self, item: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict]:
+        item = item * self.skip
+        frame = self.video.frames[item]
+        c2w = self.video.c2w(item)
+        timestep = item * self.base.t_info[-1]
+        return frame, c2w, self.video.intrinsics(), {
+            "timestep": timestep,
+        }
+
+    def predict_poses(self):
+        return self.base.render_poses
+
+    def predictor(self):
+        return NeRFPredictor(self.base.render_poses, lambda x: {"timestep": self.base.render_timesteps[x]})
+
+
+# ======================================== Data Loader ========================================
+
+def get_rays(K: np.ndarray, c2w: torch.Tensor, xs: torch.Tensor, ys: torch.Tensor) -> Rays:
+    dirs = torch.stack([(xs - K[0, 2]) / K[0, 0], -(ys - K[1, 2]) / K[1, 1], -torch.ones_like(xs)], -1)
+    # Rotate ray directions from camera frame to the world frame
+    rays_d = torch.sum(dirs[..., None, :] * c2w[:3, :3], -1)  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    # rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)  # Normalize directions
+    # Translate camera frame's origin to the world frame. It is the origin of all rays.
+    rays_o = c2w[:3, 3].expand(rays_d.shape)
+    return Rays(rays_o, rays_d)
+
+
+def pos_smoke2world(Psmoke, s2w):
+    pos_scale = Psmoke  # 2.simulation to 3.target
+    pos_rot = torch.sum(pos_scale[..., None, :] * (s2w[:3, :3]), -1)  # 3.target to 4.world
+    pos_off = (s2w[:3, -1]).expand(pos_rot.shape)  # 3.target to 4.world
+    return pos_rot + pos_off
+
+
+def convert_aabb(in_min, in_max, voxel_tran):
+    in_min = torch.tensor(in_min, device=voxel_tran.device).expand(3)
+    in_max = torch.tensor(in_max, device=voxel_tran.device).expand(3)
+    in_min = pos_smoke2world(in_min, voxel_tran)
+    in_max = pos_smoke2world(in_max, voxel_tran)
+    cmp = torch.less(in_min, in_max)
+    in_min, in_max = torch.where(cmp, in_min, in_max), torch.where(cmp, in_max, in_min)
+    return torch.cat((in_min, in_max))
+
+
+def img2mse(x: torch.Tensor, y: torch.Tensor):
+    return torch.mean((x - y) ** 2)
+
+
+def mse2psnr(x: torch.Tensor):
+    return -10. * torch.log10(x)
+
+
+def to8b(x: torch.Tensor | np.ndarray) -> np.ndarray:
+    if isinstance(x, torch.Tensor):
+        x = x.cpu().numpy()
+    return (255 * np.clip(x, 0, 1)).astype(np.uint8)
+
+
+# ======================================== Velocity ========================================
+
+def get_voxel_pts(H, W, D, s2w, n_jitter=0, r_jitter=0.8):
+    """Get voxel positions."""
+
+    i, j, k = torch.meshgrid(
+        torch.linspace(0, D - 1, D),
+        torch.linspace(0, H - 1, H),
+        torch.linspace(0, W - 1, W))
+    pts = torch.stack([(k + 0.5) / W, (j + 0.5) / H, (i + 0.5) / D], -1).to(s2w.device)
+    # shape D*H*W*3, value [(x,y,z)] , range [0,1]
+
+    jitter_r = torch.Tensor([r_jitter / W, r_jitter / H, r_jitter / D]).float().expand(pts.shape).to(s2w.device)
+    for i_jitter in range(n_jitter):
+        off_i = torch.rand(pts.shape, dtype=torch.float) - 0.5
+        # shape D*H*W*3, value [(x,y,z)] , range [-0.5,0.5]
+
+        pts = pts + off_i * jitter_r
+
+    return pos_smoke2world(pts, s2w)
+
+
+def get_density_flat(cur_pts, chunk=1024 * 32, network_fn: RadianceField = None, getStatic=True, **kwargs):
+    input_shape = list(cur_pts.shape[0:-1])
+
+    pts_flat = cur_pts.view(-1, cur_pts.shape[-1])
+    pts_N = pts_flat.shape[0]
+    # Evaluate model
+    all_sigma = []
+    for i in range(0, pts_N, chunk):
+        pts_i = pts_flat[i:i + chunk]
+
+        if isinstance(network_fn, HybridRadianceField):
+            # kwargs["opaque"] = True
+            raw_i = network_fn.static_model.query_density(pts_i[..., :3], **kwargs)
+            raw_j = network_fn.dynamic_model.query_density(pts_i)
+            all_sigma.append(torch.cat([raw_i, raw_j], -1))
+        else:
+            raw_i = network_fn.query_density(pts_i)
+            all_sigma.append(raw_i)
+
+    all_sigma = torch.cat(all_sigma, 0).view(input_shape + [-1])
+    den_raw = all_sigma[..., -1:]
+    returnStatic = getStatic and (all_sigma.shape[-1] > 1)
+    if returnStatic:
+        static_raw = all_sigma[..., :1]
+        return [den_raw, static_raw]
+    return [den_raw]
+
+
+def get_velocity_flat(cur_pts, chunk=1024 * 32, vel_model=None):
+    pts_N = cur_pts.shape[0]
+    world_v = []
+    for i in range(0, pts_N, chunk):
+        input_i = cur_pts[i:i + chunk]
+        vel_i = vel_model(input_i)
+        world_v.append(vel_i)
+    world_v = torch.cat(world_v, 0)
+    return world_v
+
+
+def vel_world2smoke(Vworld, w2s, st_factor):
+    vel_rot = Vworld[..., None, :] * (w2s[:3, :3])
+    vel_rot = torch.sum(vel_rot, -1)  # 4.world to 3.target
+    vel_scale = vel_rot * st_factor  # 3.target to 2.simulation
+    return vel_scale
+
+
+def vel_smoke2world(Vsmoke, s2w, st_factor):
+    vel_scale = Vsmoke / st_factor  # 2.simulation to 3.target
+    vel_rot = torch.sum(vel_scale[..., None, :] * (s2w[:3, :3]), -1)  # 3.target to 4.world
+    return vel_rot
+
+
+def pos_world2smoke(Pworld, w2s):
+    # pos_rot = torch.sum(Pworld[..., None, :] * (w2s[:3,:3]), -1) # 4.world to 3.target
+    pos_rot = (w2s[:3, :3] @ Pworld[..., :, None]).squeeze()
+    pos_off = (w2s[:3, -1]).expand(pos_rot.shape)  # 4.world to 3.target
+    new_pose = pos_rot + pos_off
+    return new_pose
+
+
+def off_smoke2world(Offsmoke, s2w):
+    off_scale = Offsmoke  # 2.simulation to 3.target
+    off_rot = torch.sum(off_scale[..., None, :] * (s2w[:3, :3]), -1)  # 3.target to 4.world
+    return off_rot
+
+
+def den_scalar2rgb(den, scale: float | None = 160.0, is3D=False, logv=False, mix=True):
+    # den: a np.float32 array, in shape of (?=b,) d,h,w,1 for 3D and (?=b,)h,w,1 for 2D
+    # scale: scale content to 0~255, something between 100-255 is usually good.
+    #        content will be normalized if scale is None
+    # logv: visualize value with log
+    # mix: use averaged value as a volumetric visualization if True, else show middle slice
+
+    ori_shape = list(den.shape)
+    if ori_shape[-1] != 1:
+        ori_shape.append(1)
+        den = np.reshape(den, ori_shape)
+
+    if is3D:
+        new_range = list(range(len(ori_shape)))
+        z_new_range = new_range[:]
+        z_new_range[-4] = new_range[-3]
+        z_new_range[-3] = new_range[-4]
+        # print(z_new_range)
+        YZXden = np.transpose(den, z_new_range)
+
+        if not mix:
+            _yz = YZXden[..., (ori_shape[-2] - 1) // 2, :]
+            _yx = YZXden[..., (ori_shape[-4] - 1) // 2, :, :]
+            _zx = YZXden[..., (ori_shape[-3] - 1) // 2, :, :, :]
+        else:
+            _yz = np.average(YZXden, axis=-2)
+            _yx = np.average(YZXden, axis=-3)
+            _zx = np.average(YZXden, axis=-4)
+            # print(_yx.shape, _yz.shape, _zx.shape)
+
+        # in case resolution is not a cube, (res,res,res)
+        _yxz = np.concatenate([  # yz, yx, zx
+            _yx, _yz], axis=-2)  # (?=b,),h,w+zdim,1
+
+        if ori_shape[-3] < ori_shape[-4]:
+            pad_shape = list(_yxz.shape)  # (?=b,),h,w+zdim,1
+            pad_shape[-3] = ori_shape[-4] - ori_shape[-3]
+            _pad = np.zeros(pad_shape, dtype=np.float32)
+            _yxz = np.concatenate([_yxz, _pad], axis=-3)
+        elif ori_shape[-3] > ori_shape[-4]:
+            pad_shape = list(_zx.shape)  # (?=b,),h,w+zdim,1
+            pad_shape[-3] = ori_shape[-3] - ori_shape[-4]
+
+            _zx = np.concatenate(
+                [_zx, np.zeros(pad_shape, dtype=np.float32)], axis=-3)
+
+        midDen = np.concatenate([  # yz, yx, zx
+            _yxz, _zx
+        ], axis=-2)  # (?=b,),h,w*3,1
+    else:
+        midDen = den
+
+    if logv:
+        midDen = np.log10(midDen + 1)
+    if scale is None:
+        midDen = midDen / max(midDen.max(), 1e-6) * 255.0
+    else:
+        midDen = midDen * scale
+    grey = np.clip(midDen, 0, 255)
+
+    return grey.astype(np.uint8)[::-1]  # flip y
+
+
+class VoxelTool(object):
+
+    def __get_tri_slice(self, _xm, _ym, _zm, _n=1):
+        _yz = torch.reshape(self.pts[..., _xm:_xm + _n, :], (-1, 3))
+        _zx = torch.reshape(self.pts[:, _ym:_ym + _n, ...], (-1, 3))
+        _xy = torch.reshape(self.pts[_zm:_zm + _n, ...], (-1, 3))
+
+        pts_mid = torch.cat([_yz, _zx, _xy], dim=0)
+        npMaskXYZ = [np.zeros([self.D, self.H, self.W, 1], dtype=np.float32) for _ in range(3)]
+        npMaskXYZ[0][..., _xm:_xm + _n, :] = 1.0
+        npMaskXYZ[1][:, _ym:_ym + _n, ...] = 1.0
+        npMaskXYZ[2][_zm:_zm + _n, ...] = 1.0
+        return pts_mid, torch.tensor(np.clip(npMaskXYZ[0] + npMaskXYZ[1] + npMaskXYZ[2], 1e-6, 3.0), device=pts_mid.device)
+
+    def __pad_slice_to_volume(self, _slice, _n, mode=0):
+        # mode: 0, x_slice, 1, y_slice, 2, z_slice
+        tar_shape = [self.D, self.H, self.W]
+        in_shape = tar_shape[:]
+        in_shape[-1 - mode] = _n
+        fron_shape = tar_shape[:]
+        fron_shape[-1 - mode] = (tar_shape[-1 - mode] - _n) // 2
+        back_shape = tar_shape[:]
+        back_shape[-1 - mode] = (tar_shape[-1 - mode] - _n - fron_shape[-1 - mode])
+
+        cur_slice = _slice.view(in_shape + [-1])
+        front_0 = torch.zeros(fron_shape + [cur_slice.shape[-1]], device=_slice.device)
+        back_0 = torch.zeros(back_shape + [cur_slice.shape[-1]], device=_slice.device)
+
+        volume = torch.cat([front_0, cur_slice, back_0], dim=-2 - mode)
+        return volume
+
+    def __init__(self, voxel_tran: torch.Tensor, voxel_tran_inv: torch.Tensor, scene_scale: np.ndarray,
+                 x: int, middle_view: bool = True):
+        assert scene_scale[0] == 1.0  # normalized by x /= x[0]
+        scene_size = (scene_scale * x).round().astype(int)
+        W, H, D = scene_size
+        self.s_s2w = voxel_tran
+        self.s_w2s = voxel_tran_inv
+        self.D = D
+        self.H = H
+        self.W = W
+        self.pts = get_voxel_pts(H, W, D, self.s_s2w)
+        self.pts_mid = None
+        self.mask_xyz = None
+        self.middle_view = middle_view
+        if middle_view is not None:
+            _n = 1 if middle_view else 3
+            _xm, _ym, _zm = (W - _n) // 2, (H - _n) // 2, (D - _n) // 2
+            self.pts_mid, self.mask_xyz = self.__get_tri_slice(_xm, _ym, _zm, _n)
+
+    def voxel_size(self) -> tuple[int, int, int]:
+        return self.W, self.H, self.D
+
+    def get_voxel_density_list(self, t=None, chunk=1024 * 32, network_fn=None, middle_slice=False, **kwargs):
+        D, H, W = self.D, self.H, self.W
+        # middle_slice, only for fast visualization of the middle slice
+        pts_flat = self.pts_mid if middle_slice else self.pts.view(-1, 3)
+        if t is not None:
+            pts_flat = attach_time(pts_flat, t)
+
+        den_list = get_density_flat(pts_flat, chunk, network_fn, **kwargs)
+
+        return_list = []
+        for den_raw in den_list:
+            if middle_slice:
+                # only for fast visualization of the middle slice
+                _n = 1 if self.middle_view else 3
+                _yzV, _zxV, _xyV = torch.split(den_raw, [D * H * _n, D * W * _n, H * W * _n], dim=0)
+                mixV = self.__pad_slice_to_volume(_yzV, _n, 0) + self.__pad_slice_to_volume(_zxV, _n, 1) + self.__pad_slice_to_volume(_xyV, _n, 2)
+                return_list.append(mixV / self.mask_xyz)
+            else:
+                return_list.append(den_raw.view(D, H, W, 1))
+        return return_list
+
+    def get_voxel_velocity(self, deltaT, t, chunk=1024 * 32,
+                           vel_model=None, middle_slice=False, ref_den_list=None):
+        # middle_slice, only for fast visualization of the middle slice
+        D, H, W = self.D, self.H, self.W
+        pts_flat = self.pts_mid if middle_slice else self.pts.view(-1, 3)
+        if t is not None:
+            pts_flat = attach_time(pts_flat, t)
+
+        world_v = get_velocity_flat(pts_flat, chunk, vel_model)
+        reso_scale = torch.tensor([self.W * deltaT, self.H * deltaT, self.D * deltaT], device=pts_flat.device)
+        target_v = vel_world2smoke(world_v, self.s_w2s, reso_scale)
+
+        if middle_slice:
+            _n = 1 if self.middle_view else 3
+            _yzV, _zxV, _xyV = torch.split(target_v, [D * H * _n, D * W * _n, H * W * _n], dim=0)
+            mixV = self.__pad_slice_to_volume(_yzV, _n, 0) + self.__pad_slice_to_volume(_zxV, _n, 1) + self.__pad_slice_to_volume(_xyV, _n, 2)
+            target_v = mixV / self.mask_xyz
+        else:
+            target_v = target_v.view(D, H, W, 3)
+
+        if ref_den_list is not None:
+            target_v = target_v - target_v * torch.less(ref_den_list, 0.1) * 0.5
+
+        return target_v
+
+    def save_voxel_den_npz(self, den_path, t, network_fn=None, chunk=1024 * 32, save_npz=True, save_jpg=False, jpg_mix=True,
+                           noStatic=False, **kwargs):
+        voxel_den_list = self.get_voxel_density_list(t, chunk, network_fn, middle_slice=not (jpg_mix or save_npz), **kwargs)
+        head_tail = os.path.split(den_path)
+        namepre = ["", "static_"]
+        for voxel_den, npre in zip(voxel_den_list, namepre):
+            voxel_den = voxel_den.detach().cpu().numpy()
+            if save_jpg:
+                jpg_path = os.path.join(head_tail[0], npre + os.path.splitext(head_tail[1])[0] + ".jpg")
+                imageio.imwrite(jpg_path, den_scalar2rgb(voxel_den, scale=None, is3D=True, logv=False, mix=jpg_mix).squeeze())
+            if save_npz:
+                # to save some space
+                npz_path = os.path.join(head_tail[0], npre + os.path.splitext(head_tail[1])[0] + ".npz")
+                voxel_den = np.float16(voxel_den)
+                np.savez_compressed(npz_path, vel=voxel_den)
+            if noStatic:
+                break
+
+# from FFJORD github code
+def _get_minibatch_jacobian(y, x):
+    """Computes the Jacobian of y wrt x assuming minibatch-mode.
+    Args:
+      y: (N, ...) with a total of D_y elements in ...
+      x: (N, ...) with a total of D_x elements in ...
+    Returns:
+      The minibatch Jacobian matrix of shape (N, D_y, D_x)
+    """
+    assert y.shape[0] == x.shape[0]
+    y = y.view(y.shape[0], -1)
+
+    # Compute Jacobian row by row.
+    jac = []
+    for j in range(y.shape[1]):
+        dy_j_dx = torch.autograd.grad(
+            y[:, j],
+            x,
+            torch.ones_like(y[:, j], device=y.get_device()),
+            retain_graph=True,
+            create_graph=True,
+        )[0].view(x.shape[0], -1)
+        jac.append(torch.unsqueeze(dy_j_dx, 1))
+    jac = torch.cat(jac, 1)
+    return jac
+
+def get_density_and_derivatives(cur_pts, chunk=1024*32, network_fn=None, **kwargs):
+    _den = get_density_flat(cur_pts, chunk, network_fn, False, **kwargs)[0]
+    # requires 1 backward passes
+    # The minibatch Jacobian matrix of shape (N, D_y=1, D_x=4)
+    jac = _get_minibatch_jacobian(_den, cur_pts)
+    jac = torch.where(torch.isnan(jac), 0.0, jac)   # fix for s-density in neus
+    # assert not torch.any(torch.isnan(jac))
+    _d_x, _d_y, _d_z, _d_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)] # (N,1)
+    return _den, _d_x, _d_y, _d_z, _d_t
+
+
+def get_velocity_and_derivatives(cur_pts, chunk=1024*32, vel_model=None):
+    _vel = get_velocity_flat(cur_pts, chunk, vel_model)
+    # requires 3 backward passes
+    # The minibatch Jacobian matrix of shape (N, D_y=3, D_x=4)
+    jac = _get_minibatch_jacobian(_vel, cur_pts)
+    _u_x, _u_y, _u_z, _u_t = [torch.squeeze(_, -1) for _ in jac.split(1, dim=-1)] # (N,3)
+    return _vel, _u_x, _u_y, _u_z, _u_t
+
+def PDE_EQs(D_t, D_x, D_y, D_z, U, U_t=None, U_x=None, U_y=None, U_z=None):
+    eqs = []
+    dts = [D_t]
+    dxs = [D_x]
+    dys = [D_y]
+    dzs = [D_z]
+
+    if None not in [U_t, U_x, U_y, U_z]:
+        dts += U_t.split(1, dim = -1) # [d_t, u_t, v_t, w_t] # (N,1)
+        dxs += U_x.split(1, dim = -1) # [d_x, u_x, v_x, w_x]
+        dys += U_y.split(1, dim = -1) # [d_y, u_y, v_y, w_y]
+        dzs += U_z.split(1, dim = -1) # [d_z, u_z, v_z, w_z]
+
+    u,v,w = U.split(1, dim=-1) # (N,1)
+    for dt, dx, dy, dz in zip (dts, dxs, dys, dzs):
+        _e = dt + (u*dx + v*dy + w*dz)
+        eqs += [_e]
+    # transport and nse equations:
+    # e1 = d_t + (u*d_x + v*d_y + w*d_z) - PecInv*(c_xx + c_yy + c_zz)          , should = 0
+    # e2 = u_t + (u*u_x + v*u_y + w*u_z) + p_x - ReyInv*(u_xx + u_yy + u_zz)    , should = 0
+    # e3 = v_t + (u*v_x + v*v_y + w*v_z) + p_y - ReyInv*(v_xx + v_yy + v_zz)    , should = 0
+    # e4 = w_t + (u*w_x + v*w_y + w*w_z) + p_z - ReyInv*(w_xx + w_yy + w_zz)    , should = 0
+    # e5 = u_x + v_y + w_z                                                      , should = 0
+    # For simplification, we assume PecInv = 0.0, ReyInv = 0.0, pressure p = (0,0,0)
+
+    if None not in [U_t, U_x, U_y, U_z]:
+        # eqs += [ u_x + v_y + w_z ]
+        eqs += [ dxs[1] + dys[2] + dzs[3] ]
+
+    if True: # scale regularization
+        eqs += [ (u*u + v*v + w*w)* 1e-1]
+
+    return eqs
+
+# ======================================== Velocity ========================================
+
 if __name__ == "__main__":
     device = torch.device("cuda:0")
     ### ==================== LOAD CONFIG ==================== ###
@@ -1108,6 +1980,29 @@ if __name__ == "__main__":
     lrate = 0.0005
     vel_delay = 20000
     n_rand = 1024
+    tempo_fading_in = 2000
+    datadir = "./data/pinf/Sphere"
+    half_res = "normal"
+    testskip = 20
+    vgg_strides = 4
+    precrop_iters = 500
+    precrop_frac = 0.5
+    N_samples = 32
+    perturb = 1.0
+    bbox_min = 0.0
+    bbox_max = 1.0
+    chunk = 4096
+    vggW = 0.003
+    ghostW = 0.003
+    ghost_scale = 9.0
+    overlayW = 0.002
+    eikonal = 0.01
+    devW = 0.0
+    lrate_decay = 500
+    vol_output_W = 128
+    vel_no_slip = False
+    nseW = 0.001
+    neumann = 1.0
     ### ==================== TEMP ARGS ==================== ###
 
     model = HybridRadianceField(
@@ -1124,6 +2019,253 @@ if __name__ == "__main__":
     ### ==================== PREPARE FOR ITERATION ==================== ###
     start = 0
     global_step = start
+    n_iters = 100
     velInStep = vel_delay
     ### ==================== PREPARE FOR ITERATION ==================== ###
+    vgg_tool = VGGLossTool(device)
+    pinf_data = PINFFrameData(datadir, half_res=half_res, normalize_time=True)
+    train_data = PINFDataset(pinf_data)
+    test_data = PINFTestDataset(pinf_data, skip=testskip, video_id=0)
+    t_info = pinf_data.t_info
+    bkg_color = torch.tensor(pinf_data.bkg_color, device=device)
+    in_min = [bbox_min]
+    in_max = [bbox_max]
+    voxel_tran = pinf_data.voxel_tran
+    voxel_tran[:3, :3] *= pinf_data.voxel_scale
+    voxel_tran = torch.tensor(voxel_tran, device=device)
+    voxel_tran_inv = torch.inverse(voxel_tran)
+    scene_scale = pinf_data.voxel_scale / pinf_data.voxel_scale[0]
+    aabb = convert_aabb(in_min, in_max, voxel_tran)
+
+    min_ratio = float(64 + 4 * 2) / min(scene_scale[0], scene_scale[1], scene_scale[2])
+    train_x = max(vol_output_W, int(min_ratio * scene_scale[0] + 0.5))
+    training_voxel = VoxelTool(voxel_tran, voxel_tran_inv, scene_scale, train_x)
+    training_pts = torch.reshape(training_voxel.pts, (-1, 3))
+    voxel_writer = training_voxel
+
+    split_nse_wei = [2.0, 1e-3, 1e-3, 1e-3, 5e-3, 5e-3]
+
+    renderer = PINFRenderer(
+        model=model,
+        prop_model=prop_model,
+        n_samples=N_samples,
+        n_importance=N_importance,
+        near=pinf_data.near,
+        far=pinf_data.far,
+        perturb=perturb > 0,
+        vel_model=vel_model,
+        aabb=aabb,
+    )
+
     model_fading_update(model, prop_model, vel_model, start, velInStep)
+    for i in tqdm.trange(n_iters):
+        model_fading_update(model, prop_model, vel_model, global_step, velInStep)
+        tempo_fading = fade_in_weight(global_step, 0, tempo_fading_in)
+        vel_fading = fade_in_weight(global_step, velInStep, 10000)
+        warp_fading = fade_in_weight(global_step, velInStep + 10000, 20000)
+        vgg_fading = [fade_in_weight(global_step, (vgg_i - 1) * 10000, 10000) for vgg_i in range(len(vgg_tool.layer_list), 0, -1)]
+        ghost_fading = fade_in_weight(global_step, 2000, 20000)
+
+        # Random from one frame
+        video, frame_i = train_data.get_video_and_frame(np.random.randint(len(train_data)))
+        target = torch.tensor(video.frames[frame_i], device=device)
+        K = video.intrinsics()
+        H, W = target.shape[:2]
+        pose = torch.tensor(video.c2w(frame_i), device=device)
+        time_locate = t_info[-1] * frame_i
+        background = bkg_color
+
+        trainVel = (global_step >= velInStep) and (i % 10 == 0)
+        if trainVel:
+            # take a mini_batch 32*32*32
+            train_x, train_y, train_z = training_voxel.voxel_size()
+            train_random = np.random.choice(train_z * train_y * train_x, 32 * 32 * 32)
+            training_samples = training_pts[train_random]
+
+            training_samples = training_samples.view(-1, 3)
+            training_t = torch.ones([training_samples.shape[0], 1], device=device) * time_locate
+            training_samples = torch.cat([training_samples, training_t], dim=-1)
+
+            #####  core velocity optimization loop  #####
+            # allows to take derivative w.r.t. training_samples
+            training_samples = training_samples.detach().requires_grad_(True)
+            _vel, _u_x, _u_y, _u_z, _u_t = get_velocity_and_derivatives(training_samples, chunk=chunk, vel_model=vel_model)
+            if vel_no_slip:
+                smoke_model = model
+            else:
+                smoke_model = model.dynamic_model if isinstance(model, HybridRadianceField) else model
+            _den, _d_x, _d_y, _d_z, _d_t = get_density_and_derivatives(
+                training_samples, chunk=chunk,
+                network_fn=smoke_model,
+                opaque=True,  # for neus
+            )
+
+            vel_optimizer.zero_grad()
+            split_nse = PDE_EQs(
+                _d_t.detach(), _d_x.detach(), _d_y.detach(), _d_z.detach(),
+                _vel, _u_t, _u_x, _u_y, _u_z)
+            nse_errors = [torch.mean(torch.square(x)) for x in split_nse]
+            nseloss_fine = 0.0
+            for ei, wi in zip(nse_errors, split_nse_wei):
+                nseloss_fine = ei * wi + nseloss_fine
+            vel_loss = nseloss_fine * nseW * vel_fading
+
+            # Neumann loss
+            if isinstance(model, HybridRadianceField) and isinstance(model.static_model, SDFRadianceField):
+                sdf_model = model.static_model
+                with torch.no_grad():
+                    if isinstance(sdf_model, NeuS):
+                        sdf, gradient = sdf_model.forward_with_gradient(training_samples[..., :3])
+                        sdf = sdf[..., :1]
+                    else:
+                        sdf = sdf_model.sdf(training_samples[..., :3])
+                        gradient = sdf_model.gradient(training_samples[..., :3])
+                sdf, gradient = sdf.detach(), gradient.detach()
+                neumann_loss = sdf_model.opaque_density(sdf).detach() * F.relu(-torch.sum(_vel * gradient, dim=-1, keepdim=True))
+                neumann_loss = torch.mean(neumann_loss)
+                if neumann > 0.0:
+                    vel_loss = vel_loss + neumann_loss * neumann
+                del sdf, gradient
+                neumann_loss = neumann_loss.detach()
+                # writer.add_scalar('Neumann loss', neumann_loss, i)
+
+            vel_loss.backward()
+            vel_optimizer.step()
+
+            # cleanup
+            del _vel, _u_x, _u_y, _u_z, _u_t, _den, _d_x, _d_y, _d_z, _d_t, split_nse
+            nse_errors = tuple(x.item() for x in nse_errors)
+            nseloss_fine = nseloss_fine.item()
+            vel_loss = vel_loss.item()
+
+        trainVGG = (i % 4 == 0)
+        if trainVGG:
+            coords_crop, dw = vgg_sample(vgg_strides, n_rand, target, bkg_color, steps=i)
+            coords_crop = torch.reshape(coords_crop, [-1, 2])
+            ys, xs = coords_crop[:, 0], coords_crop[:, 1]  # vgg_sample using ij, convert to xy
+        else:
+            if i < precrop_iters:
+                dH = int(H // 2 * precrop_frac)
+                dW = int(W // 2 * precrop_frac)
+                xs, ys = torch.meshgrid(
+                    torch.linspace(W // 2 - dW, W // 2 + dW - 1, 2 * dW),
+                    torch.linspace(H // 2 - dH, H // 2 + dH - 1, 2 * dH),
+                    indexing='xy'
+                )
+                selected = np.random.choice(4 * dH * dW, size=[n_rand], replace=False)
+                if i == start:
+                    print(f"[Config] Center cropping of size {2 * dH} x {2 * dW} is enabled until iter {precrop_iters}")
+            else:
+                xs, ys = torch.meshgrid(torch.linspace(0, W - 1, W), torch.linspace(0, H - 1, H), indexing='xy')
+                selected = np.random.choice(H * W, size=[n_rand], replace=False)
+            xs = torch.flatten(xs)[selected].to(device)
+            ys = torch.flatten(ys)[selected].to(device)
+
+        rays = get_rays(K, pose, xs, ys)  # (n_rand, 3), (n_rand, 3)
+        rays = rays.foreach(lambda t: t.to(device))
+        target_s = target[ys.long(), xs.long()]  # (n_rand, 3)
+
+        if global_step >= velInStep:
+            renderer.warp_fading_dt = warp_fading * t_info[-1]
+
+        #####  core radiance optimization loop  #####
+        output = renderer.render(
+            rays.origins, rays.viewdirs, chunk=chunk,
+            ret_raw=True,
+            timestep=time_locate,
+            background=background)
+        rgb, _, acc, extras = output.as_tuple()
+        out0: NeRFOutputs | None = extras.get('coarse')
+
+        optimizer.zero_grad()
+        img_loss = img2mse(rgb, target_s)
+        if 'static' in extras and tempo_fading < 1.0 - 1e-8:
+            img_loss = img_loss * tempo_fading + img2mse(extras['static'].rgb, target_s) * (1.0 - tempo_fading)
+            # rgb = rgb * tempo_fading + extras['rgbh1'] * (1.0-tempo_fading)
+        loss = img_loss
+        psnr = mse2psnr(img_loss.detach())
+
+        if out0 is not None:
+            img_loss0 = img2mse(out0.rgb, target_s)
+            if 'static' in out0.extras and tempo_fading < 1.0 - 1e-8:
+                img_loss0 = img_loss0 * tempo_fading + img2mse(out0.extras['static'].rgb, target_s) * (1.0 - tempo_fading)
+            loss = loss + img_loss0
+
+        if trainVGG:
+            vgg_loss_func = vgg_tool.compute_cos_loss
+            vgg_tar = torch.reshape(target_s, [dw, dw, 3])
+            vgg_img = torch.reshape(rgb, [dw, dw, 3])
+            vgg_loss = vgg_loss_func(vgg_img, vgg_tar)
+            w_vgg = vggW / float(len(vgg_loss))
+            vgg_loss_sum = 0
+            for _w, _wf in zip(vgg_loss, vgg_fading):
+                if _wf > 1e-8:
+                    vgg_loss_sum = _w * _wf * w_vgg + vgg_loss_sum
+
+            if out0 is not None:
+                vgg_img0 = torch.reshape(out0.rgb, [dw, dw, 3])
+                vgg_loss0 = vgg_loss_func(vgg_img0, vgg_tar)
+                for _w, _wf in zip(vgg_loss0, vgg_fading):
+                    if _wf > 1e-8:
+                        vgg_loss_sum = _w * _wf * w_vgg + vgg_loss_sum
+            loss += vgg_loss_sum
+
+        if (ghostW > 0.0) and background is not None:
+            w_ghost = ghost_fading * ghostW
+            if w_ghost > 1e-8:
+                ghost_loss = ghost_loss_func(output, background, ghost_scale)
+                if 'static' in extras:  # static part
+                    ghost_loss += 0.1 * ghost_loss_func(extras['static'], background, ghost_scale)
+                    if 'dynamic' in extras:  # dynamic part
+                        ghost_loss += 0.1 * ghost_loss_func(extras['dynamic'], extras['static'].rgb, ghost_scale)
+
+                if out0 is not None:
+                    ghost_loss0 = ghost_loss_func(out0, background, ghost_scale)
+                    if 'static' in out0.extras:  # static part
+                        # ghost_loss0 += 0.1*ghost_loss_func(extras['rgbh10'], static_back, extras['acch10'], den_penalty=0.0)
+                        if 'dynamic' in out0.extras:  # dynamic part
+                            ghost_loss += 0.1 * ghost_loss_func(out0.extras['dynamic'], out0.extras['static'].rgb,
+                                                                ghost_scale)
+
+                    ghost_loss += ghost_loss0
+
+                loss += ghost_loss * w_ghost
+
+        w_overlay = overlayW * ghost_fading  # with fading
+        if 'static' in extras and w_overlay > 0:
+            # density should be either from smoke or from static, not mixed.
+            smoke_den = extras['sigma_d']
+            if 'sdf' in extras:
+                inv_s = extras['inv_s'].detach()  # as constant
+                static_den = inv_s * torch.sigmoid(-inv_s * extras['sdf']) / 2  # opaque_density
+            else:
+                static_den = extras['sigma_s']
+            overlay_loss = (smoke_den * static_den) / (torch.square(smoke_den) + torch.square(static_den) + 1e-8)
+            overlay_loss = torch.mean(overlay_loss)
+            loss += overlay_loss * w_overlay
+
+        eikonal_loss = extras.get('eikonal_loss')
+        eikonal_weight = eikonal
+        if eikonal_loss is not None and eikonal_weight > 0:
+            # eikonal_weight = np.clip(i / 10000, 0.0, 1.0) * 0.001
+            loss += eikonal_loss * eikonal_weight
+            # writer.add_scalar('eikonal_loss', eikonal_loss, i)
+            if i > 20000 and extras['inv_s'] < 100.0 and devW > 0:
+                loss += devW / extras['inv_s']
+
+        loss.backward()
+        optimizer.step()
+
+        ###   update learning rate   ###
+        decay_rate = 0.1
+        decay_steps = lrate_decay * 1000
+        new_lrate = lrate * (decay_rate ** (global_step / decay_steps))
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = new_lrate
+        if trainVel and vel_optimizer is not None:
+            for param_group in vel_optimizer.param_groups:
+                param_group['lr'] = new_lrate
+
+        print(f"loss: {loss.item():.4f}, img_loss: {img_loss.item():.4f}, psnr: {psnr.item():.2f}")
+
+        global_step += 1
